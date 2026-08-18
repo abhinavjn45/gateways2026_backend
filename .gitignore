@@ -39,3 +39,6 @@ MEMORY.md
 
 # Subagent-driven-development scratch workspace
 .superpowers/
+
+#debugging
+dbg.tmp.ts
