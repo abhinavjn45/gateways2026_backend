@@ -595,7 +595,7 @@ export async function findOrCreateOAuthUser(
 
     // Step 2: existing user with same email?
     const existingUserRows = await (tx as Db)
-      .select({ id: users.id })
+      .select({ id: users.id, emailVerified: users.emailVerified, passwordHash: users.passwordHash })
       .from(users)
       .where(eq(sql`LOWER(${users.email})`, params.email.toLowerCase()))
       .limit(1);
@@ -603,10 +603,29 @@ export async function findOrCreateOAuthUser(
     let targetUserId: string;
 
     if (existingUserRows[0]) {
-      // Link OAuth account to existing manual account. Google has verified this
-      // same email address, so a manual account still pending its own OTP is
-      // now considered verified too.
-      targetUserId = existingUserRows[0].id;
+      const existing = existingUserRows[0];
+      targetUserId = existing.id;
+
+      // A VERIFIED existing account linking Google is the legitimate case: its
+      // owner already proved the address once (password flow) and is now
+      // proving it again (Google), so trust both credentials going forward.
+      //
+      // An UNVERIFIED existing account is different and dangerous to link
+      // blindly. Nobody has proven ownership of that row yet — it could be an
+      // attacker's pre-registration of the victim's email address, sitting on
+      // a password only the attacker knows (a "pre-hijack" account takeover:
+      // register the victim's email first, wait for them to "create" their
+      // account via Google, then sign in later with the password already set).
+      // Clearing the password before marking verified matches the re-signup
+      // path in signupWithPassword — an unverified row's password was never
+      // proven by anyone, so it does not get to survive into the account
+      // Google just verified.
+      if (!existing.emailVerified && existing.passwordHash) {
+        await (tx as Db)
+          .update(users)
+          .set({ passwordHash: null, mustChangePassword: false })
+          .where(eq(users.id, targetUserId));
+      }
       await markEmailVerified(tx as Db, targetUserId);
     } else {
       // Step 3: brand new user. Google has already verified this email address

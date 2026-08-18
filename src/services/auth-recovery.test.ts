@@ -16,6 +16,7 @@ import { getAppDb } from '../db/index.js';
 import { users, accounts } from '../db/schema/auth.js';
 import { deleteTestUser } from '../test-helpers/db.js';
 import { hashPassword } from '../security/password.js';
+import { findOrCreateOAuthUser } from '../repositories/auth.repository.js';
 
 const db = getAppDb();
 const PASSWORD = 'hunter2hunter2';
@@ -165,6 +166,71 @@ describe('OAuth accounts are never password-prompted', () => {
     const res = await signin(email);
     expect(res.statusCode).toBe(401);
     expect(res.json().error.code).toBe('INVALID_CREDENTIALS');
+  });
+});
+
+describe('OAuth linking cannot inherit a pre-hijack password', () => {
+  it('clears the password on an unverified account before linking Google', async () => {
+    const email = freshEmail('prehijack');
+    const userId = uuidv7();
+    cleanup.push(userId);
+
+    // Simulate the attack setup: an attacker (or a stale pre-fix row) created
+    // an unverified account for the victim's address, sitting on a password
+    // only the attacker knows.
+    await db.insert(users).values({
+      id: userId,
+      email,
+      passwordHash: await hashPassword('attacker-chosen-password'),
+      status: 'ACTIVE',
+      emailVerified: null,
+    });
+
+    // The victim now signs in with Google for the same address — the actual
+    // owner proving ownership for the first time.
+    const linkedUserId = await findOrCreateOAuthUser(db, {
+      userId: uuidv7(),
+      accountId: uuidv7(),
+      email,
+      provider: 'google',
+      providerAccountId: `google-${userId}`,
+      googleProfile: { name: 'Victim' },
+    });
+
+    expect(linkedUserId).toBe(userId);
+
+    const [row] = await db
+      .select({ passwordHash: users.passwordHash, emailVerified: users.emailVerified })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1);
+    expect(row.emailVerified).not.toBeNull();
+    // The attacker's password must not survive into the now-verified account.
+    expect(row.passwordHash).toBeNull();
+
+    // And it must actually be unusable, not just null in this one column.
+    const res = await signin(email, 'attacker-chosen-password');
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('does NOT clear the password when linking to an already-verified account', async () => {
+    // The legitimate case: someone with an existing verified password account
+    // enables "Sign in with Google" — both credentials should keep working.
+    const email = freshEmail('legit-link');
+    await signup(email);
+    const userId = await trackByEmail(email);
+
+    const linkedUserId = await findOrCreateOAuthUser(db, {
+      userId: uuidv7(),
+      accountId: uuidv7(),
+      email,
+      provider: 'google',
+      providerAccountId: `google-${userId}`,
+      googleProfile: { name: 'Owner' },
+    });
+    expect(linkedUserId).toBe(userId);
+
+    expect((await signin(email)).statusCode).toBe(200);
   });
 });
 
