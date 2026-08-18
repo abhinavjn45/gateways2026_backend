@@ -10,8 +10,8 @@
  *   - User existence is never revealed on login failure (returns INVALID_CREDENTIALS always).
  *   - BANNED / INACTIVE users receive FORBIDDEN (403), not INVALID_CREDENTIALS.
  *   - Email verification is required before password-login is allowed.
- *   - Google OAuth users must complete the same app-owned email OTP flow as
- *     password signups before a website session is issued.
+ *   - Google OAuth already verifies the email address, so Google sign-ins skip
+ *     the app-owned OTP flow entirely and get a session immediately.
  *   - Raw session token never touches the DB — only its SHA-256 hash.
  */
 
@@ -45,6 +45,9 @@ import {
   findVerificationTokenByToken,
   markEmailVerified,
   updatePassword,
+  verifyEmailAtomically,
+  hasLinkedOAuthAccount,
+  resetUserCredentials,
   upsertVerificationToken,
   consumeVerificationTokenByToken,
 } from '../repositories/auth.repository.js';
@@ -65,6 +68,7 @@ const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const CSRF_COOKIE_NAME = 'csrf_token';
 const OAUTH_STATE_COOKIE_NAME = 'oauth_state';
 const OAUTH_RETURN_TO_COOKIE_NAME = 'oauth_return_to';
+const OAUTH_CLIENT_COOKIE_NAME = 'oauth_client';
 const PASSWORD_RESET_PURPOSE = 'PASSWORD_RESET';
 const PASSWORD_RESET_GENERIC_MESSAGE =
   'If an account exists for that email, we sent a password reset link.';
@@ -161,32 +165,44 @@ async function createSessionAndIssueCredentials(
  * failure can be recovered by requesting another code without recreating the
  * account.
  */
-async function sendVerificationCode(email: string, config: AppConfig): Promise<void> {
+async function sendVerificationCode(
+  email: string,
+  config: AppConfig,
+): Promise<{ delivered: boolean }> {
   const otp = generateOtp();
   const hashedOtp = await hashOtp(otp);
   const otpExpires = new Date(Date.now() + config.OTP_EXPIRY_MINUTES * 60 * 1000);
 
-  await upsertVerificationToken(getAppDb(), {
+  // Stored BEFORE any delivery attempt, so a failed send still leaves a token
+  // that "resend" can replace and the user can eventually enter.
+  await upsertVerificationToken(getWriterDb(), {
     identifier: email,
     hashedOtp,
     expires: otpExpires,
     purpose: 'EMAIL_VERIFICATION',
   });
 
-  try {
-    await emailService.sendVerificationEmail({
-      to: email,
-      verificationToken: otp,
-    });
-  } catch (error) {
-    // Do not leak SMTP details or the OTP to the browser. The token remains
-    // replaceable through resend-verification.
-    console.error('Verification email delivery failed:', error instanceof Error ? error.message : String(error));
-    throw createDataError(
-      'STORAGE_UNAVAILABLE',
-      'Your account was created, but the verification email could not be sent. Please request a new code.',
-    );
-  }
+  // ── SMTP DISABLED ─────────────────────────────────────────────────────────
+  // Mail is not provisioned, and REQUIRE_EMAIL_VERIFICATION is off, so nothing
+  // reaches this in normal operation. Re-enable together with that flag.
+  //
+  // try {
+  //   await emailService.sendVerificationEmail({ to: email, verificationToken: otp });
+  //   return { delivered: true };
+  // } catch (error) {
+  //   // Never leak SMTP details or the OTP to the browser.
+  //   console.error(
+  //     'Verification email delivery failed:',
+  //     error instanceof Error ? error.message : String(error),
+  //   );
+  //   return { delivered: false };
+  // }
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // Returning `false` rather than throwing is the whole point: the caller
+  // reports "created, code not sent" and keeps a recovery path open, instead
+  // of 500-ing on a committed account.
+  return { delivered: false };
 }
 
 // ─── 1. Sign Up (Password) ───────────────────────────────────────────────────
@@ -198,28 +214,75 @@ export interface SignupDto {
   fullName?: string;
 }
 
+export interface SignupResult {
+  /**
+   * ACTIVE            — account usable now, session issued alongside.
+   * VERIFICATION_SENT — code delivered, caller must verify before signing in.
+   * VERIFICATION_PENDING — account exists but the code did NOT go out.
+   *
+   * Machine-readable on purpose. This used to be prose only, so the website
+   * could not tell "we emailed you" from "we could not email you" and printed
+   * a delivery claim that was sometimes false.
+   */
+  status: 'ACTIVE' | 'VERIFICATION_SENT' | 'VERIFICATION_PENDING';
+  message: string;
+  user?: { id: string; email: string };
+  token?: string;
+  expiresAt?: string;
+}
+
 /**
  * Register a new user with email + password + unique character username.
  *
- * Flow:
- *  1. Normalize email → check for duplicate.
- *  2. Hash password (12 rounds).
- *  3. Insert user row (email unverified).
- *  4. Generate + hash 6-digit OTP, store in verification_tokens (15-min expiry).
- *  5. Send OTP email.
- *  6. Return { message } — NO session yet. User must verify email first.
+ * With REQUIRE_EMAIL_VERIFICATION off (the current default) the account is
+ * created already verified and signed in — there is no pending state, and
+ * therefore none of the lockout this flow used to produce when SMTP failed.
+ *
+ * With the flag on, the OTP path below runs instead and an unverified account
+ * can always be recovered by signing up again (see the re-signup branch).
  */
 export async function signupWithPassword(
   dto: SignupDto,
   config: AppConfig = loadConfig(),
-): Promise<{ message: string }> {
-  const db = getAppDb();
+  reply?: FastifyReply,
+  transport: AuthTransport = 'cookie',
+): Promise<SignupResult> {
+  const db = getWriterDb();
   const email = dto.email.toLowerCase().trim();
+  const requireVerification = config.REQUIRE_EMAIL_VERIFICATION;
 
-  // Duplicate check
   const existing = await findUserByEmail(db, email);
+
   if (existing) {
-    throw createDataError('EMAIL_TAKEN');
+    // A Google-backed address is never claimable with a password — that would
+    // graft a second credential onto an identity Google owns.
+    if (await hasLinkedOAuthAccount(db, existing.id)) {
+      throw createDataError('OAUTH_ACCOUNT');
+    }
+    // A verified account is a real one; refuse.
+    if (existing.emailVerified) {
+      throw createDataError('EMAIL_TAKEN');
+    }
+    // Unverified and password-backed: nobody ever proved they own this address,
+    // so treat the signup as a retry rather than a collision. Without this, a
+    // failed OTP delivery strands the address permanently — signin refuses an
+    // unverified user and signup refuses a duplicate. Unreachable while the
+    // flag is off (no unverified rows can be created), kept as the guard for
+    // when verification is switched back on.
+    await resetUserCredentials(db, {
+      userId: existing.id,
+      passwordHash: await hashPassword(dto.password),
+      username: dto.username,
+      fullName: dto.fullName,
+    });
+    const { delivered } = await sendVerificationCode(email, config);
+    return {
+      status: delivered ? 'VERIFICATION_SENT' : 'VERIFICATION_PENDING',
+      message: delivered
+        ? 'Account updated. A 6-digit verification code has been sent to your email.'
+        : 'Account updated, but the verification code could not be sent. Please use "resend code".',
+      user: { id: existing.id, email },
+    };
   }
 
   const passwordHash = await hashPassword(dto.password);
@@ -231,29 +294,34 @@ export async function signupWithPassword(
     passwordHash,
     username: dto.username,
     fullName: dto.fullName,
+    emailVerified: requireVerification ? null : new Date(),
   });
 
-  // The account row is already committed above, so a delivery failure must not
-  // fail the whole request: throwing here returned a 500 while leaving a real
-  // account behind, and the next attempt with the same address then hit
-  // EMAIL_TAKEN — the user saw an error twice and could never get in.
-  //
-  // Reporting it honestly instead, and pointing at POST /auth/resend-verification,
-  // which exists for exactly this case. Never claim a code was sent when it was not.
-  try {
-    await sendVerificationCode(email, config);
-  } catch (err) {
-    console.error(`❌ Signup committed for ${email} but the verification email failed to send:`, err);
+  // Verification off: sign them straight in. No pending state exists, so there
+  // is nothing to get stranded behind.
+  if (!requireVerification) {
+    const credentials = reply
+      ? await createSessionAndIssueCredentials(userId, reply, config, transport)
+      : null;
     return {
-      message:
-        'Account created, but the verification code could not be sent right now. ' +
-        'Please use "resend code" to receive it.',
+      status: 'ACTIVE',
+      message: 'Account created.',
+      user: { id: userId, email },
+      ...(credentials ?? {}),
     };
   }
 
+  // The account row is already committed, so a delivery failure must never fail
+  // the request — that returned a 500 while leaving a real account behind, and
+  // the retry then hit EMAIL_TAKEN. Report the outcome honestly instead; the
+  // re-signup branch above and POST /auth/resend-verification are both exits.
+  const { delivered } = await sendVerificationCode(email, config);
   return {
-    message:
-      'Account created. A 6-digit verification code has been sent to your email. Please verify to complete registration.',
+    status: delivered ? 'VERIFICATION_SENT' : 'VERIFICATION_PENDING',
+    message: delivered
+      ? 'Account created. A 6-digit verification code has been sent to your email.'
+      : 'Account created, but the verification code could not be sent. Please use "resend code".',
+    user: { id: userId, email },
   };
 }
 
@@ -407,8 +475,19 @@ export async function verifyEmail(
   token?: string;
   expiresAt?: string;
 }> {
-  const db = getAppDb();
+  const db = getWriterDb();
   const email = dto.email.toLowerCase().trim();
+
+  // Verification is off: there is no pending state for this route to resolve,
+  // and accounts are already created verified. Say so plainly rather than
+  // returning "invalid code", which would send the caller hunting for an email
+  // that was never sent. The route stays registered either way.
+  if (!config.REQUIRE_EMAIL_VERIFICATION) {
+    throw createDataError(
+      'EMAIL_NOT_VERIFIED',
+      'Email verification is currently disabled. You can sign in directly.',
+    );
+  }
 
   const tokenRow = await findVerificationToken(db, email, 'EMAIL_VERIFICATION');
 
@@ -432,14 +511,17 @@ export async function verifyEmail(
   const valid = await verifyOtp(dto.otp, tokenRow.token);
   if (!valid) throw invalidError;
 
-  // Atomic: mark verified + consume OTP token
   const user = await findUserWithHashByEmail(db, email);
   if (!user) throw invalidError; // Shouldn't happen, but guard anyway
 
-  await Promise.all([
-    markEmailVerified(db, user.id),
-    consumeVerificationToken(db, email, 'EMAIL_VERIFICATION'),
-  ]);
+  // Same suspension gate as signin. Without it, a banned user holding a valid
+  // code could verify and be handed a fresh session through this route.
+  if (user.status === 'BANNED' || user.status === 'INACTIVE') {
+    throw createDataError('FORBIDDEN', 'Your account has been suspended.');
+  }
+
+  // One transaction, not Promise.all — see verifyEmailAtomically.
+  await verifyEmailAtomically(db, { userId: user.id, email });
 
   // Create session — user is logged in immediately after verification
   const credentials = await createSessionAndIssueCredentials(user.id, reply, config, transport);
@@ -482,13 +564,17 @@ export interface SigninDto {
  */
 export async function verifyPasswordCredentials(
   dto: SigninDto,
+  config: AppConfig = loadConfig(),
 ): Promise<{ id: string; email: string }> {
   const db = getAppDb();
   const email = dto.email.toLowerCase().trim();
 
   const user = await findUserWithHashByEmail(db, email);
 
-  // Existence check — always INVALID_CREDENTIALS to avoid user enumeration
+  // Existence check. An OAuth-only account (passwordHash === null) falls in
+  // here deliberately: telling the caller "this one signs in with Google"
+  // would confirm the address exists to anyone who asks. The UI carries a
+  // static "signed up with Google?" hint instead, which reveals nothing.
   if (!user || !user.passwordHash) {
     throw createDataError('INVALID_CREDENTIALS');
   }
@@ -498,18 +584,37 @@ export async function verifyPasswordCredentials(
     throw createDataError('FORBIDDEN', 'Your account has been suspended.');
   }
 
-  // Email not verified yet
-  if (!user.emailVerified) {
-    throw createDataError(
-      'VALIDATION_FAILED',
-      'Please verify your email before signing in. Check your inbox for the verification code.',
-    );
+  // Password FIRST, verification state second.
+  //
+  // The reverse order was a user-enumeration oracle: a wrong password against
+  // an unverified account answered EMAIL_NOT_VERIFIED while a wrong password
+  // against an unknown address answered INVALID_CREDENTIALS, so anyone could
+  // sift real addresses out of a wordlist without ever guessing a password.
+  // Nothing about the account may leak until the password is proven.
+  const { valid, needsRehash } = await verifyPassword(dto.password, user.passwordHash);
+  if (!valid) {
+    throw createDataError('INVALID_CREDENTIALS');
   }
 
-  // Password check (timing-safe bcrypt compare)
-  const passwordValid = await verifyPassword(dto.password, user.passwordHash);
-  if (!passwordValid) {
-    throw createDataError('INVALID_CREDENTIALS');
+  // Upgrade a surviving bcrypt hash now that we hold the plaintext. This is the
+  // only moment it is available. Deliberately not awaited into the critical
+  // path — a slow write must not delay the login response, and a failed one
+  // just means the upgrade happens on their next sign-in instead.
+  if (needsRehash) {
+    hashPassword(dto.password)
+      .then((upgraded) => updatePassword(getWriterDb(), user.id, upgraded))
+      .catch((err) => console.error('Password rehash failed (non-fatal):', err));
+  }
+
+  // Verification gate — only when the flag is on. See REQUIRE_EMAIL_VERIFICATION
+  // in src/config/env.ts for why it is off.
+  if (config.REQUIRE_EMAIL_VERIFICATION && !user.emailVerified) {
+    // Reissue on the way out so the caller has a fresh code to enter. The user
+    // has proven the password, so this reveals nothing they did not already know.
+    sendVerificationCode(email, config).catch((err) =>
+      console.error('Could not reissue verification code:', err),
+    );
+    throw createDataError('EMAIL_NOT_VERIFIED');
   }
 
   return { id: user.id, email: user.email };
@@ -598,7 +703,14 @@ export async function changePassword(
   assertAuthenticated(request);
   const db = getAppDb();
   const user = await findUserWithHashByEmail(db, request.user.email);
-  if (!user?.passwordHash || !(await verifyPassword(dto.currentPassword, user.passwordHash))) {
+  // An OAuth account has no password to change. Safe to say so plainly: this
+  // route requires an authenticated session, so the caller already knows the
+  // account exists — there is nothing left to enumerate.
+  if (!user?.passwordHash) {
+    throw createDataError('OAUTH_ACCOUNT');
+  }
+  const { valid } = await verifyPassword(dto.currentPassword, user.passwordHash);
+  if (!valid) {
     throw createDataError('INVALID_CREDENTIALS', 'Current password is incorrect.');
   }
 
@@ -746,6 +858,13 @@ export function initiateGoogleOAuth(
   config: AppConfig,
   reply: FastifyReply,
   returnTo = '/travelling',
+  /**
+   * 'console' routes the callback to the registration console instead of the
+   * website — see the `client` branch in handleGoogleCallback. Carried in its
+   * own signed cookie alongside state/returnTo so it survives the same
+   * round-trip and cannot be forged (the callback only trusts what it signed).
+   */
+  client: 'website' | 'console' = 'website',
 ): { url: string } {
   if (!config.OAUTH_GOOGLE_CLIENT_ID) {
     throw createDataError('INTERNAL_ERROR', 'Google OAuth is not configured on this server.');
@@ -772,6 +891,14 @@ export function initiateGoogleOAuth(
     signed: true,
   });
   reply.setCookie(OAUTH_RETURN_TO_COOKIE_NAME, returnTo, {
+    httpOnly: true,
+    secure: config.NODE_ENV !== 'development',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 10 * 60,
+    signed: true,
+  });
+  reply.setCookie(OAUTH_CLIENT_COOKIE_NAME, client, {
     httpOnly: true,
     secure: config.NODE_ENV !== 'development',
     sameSite: 'lax',
@@ -822,8 +949,8 @@ interface GoogleUserInfo {
  *  1. Exchange authorization code for Google tokens.
  *  2. Fetch Google userinfo (email, name, picture).
  *  3. find-or-create user + link OAuth account (atomic DB transaction).
- *  4. Generate and send the app-owned email verification code. No session is
- *     issued until the user verifies that code.
+ *  4. Google has already verified the email, so a session is issued directly —
+ *     no app-owned OTP round-trip, no SMTP dependency on this path.
  */
 export async function handleGoogleCallback(
   code: string,
@@ -833,8 +960,18 @@ export async function handleGoogleCallback(
   state?: string,
 ): Promise<{
   user: { id: string; email: string };
-  requiresVerification: true;
+  requiresVerification: false;
   returnTo: string;
+  token?: string;
+  expiresAt?: string;
+  /**
+   * Set only for the console flow (`client=console` at /signin/google). The
+   * route redirects here instead of into the website — a bearer token cannot
+   * ride safely in a redirect URL, so this points at a one-time handoff code
+   * exchanged server-side by the console's own callback route, reusing the
+   * same console_handoffs machinery as the website's "open console" button.
+   */
+  redirectUrl?: string;
 }> {
   if (!config.OAUTH_GOOGLE_CLIENT_ID || !config.OAUTH_GOOGLE_CLIENT_SECRET) {
     throw createDataError('INTERNAL_ERROR', 'Google OAuth is not configured on this server.');
@@ -846,6 +983,10 @@ export async function handleGoogleCallback(
   reply.clearCookie(OAUTH_STATE_COOKIE_NAME, { path: '/' });
   const returnToCookie = request.cookies[OAUTH_RETURN_TO_COOKIE_NAME];
   reply.clearCookie(OAUTH_RETURN_TO_COOKIE_NAME, { path: '/' });
+  const clientCookie = request.cookies[OAUTH_CLIENT_COOKIE_NAME];
+  reply.clearCookie(OAUTH_CLIENT_COOKIE_NAME, { path: '/' });
+  const unsignedClient = clientCookie ? request.unsignCookie(clientCookie) : null;
+  const client = unsignedClient?.valid && unsignedClient.value === 'console' ? 'console' : 'website';
 
   const expectedState = stateCookie ? request.unsignCookie(stateCookie) : null;
   const requestedReturnTo = returnToCookie ? request.unsignCookie(returnToCookie) : null;
@@ -914,37 +1055,53 @@ export async function handleGoogleCallback(
     googleProfile: {
       name: googleUser.name,
       picture: googleUser.picture,
-      accessToken: tokens.access_token,
-      refreshToken: tokens.refresh_token,
       expiresAt,
       idToken: tokens.id_token,
       scope: tokens.scope,
     },
   });
 
-  // Step 4: require the same app-owned verification code as password signup.
-  // Google has authenticated the identity, but no website session is issued
-  // until the user enters the code sent to that address.
-  //
-  // A delivery failure must not fail the callback. The user and the linked
-  // OAuth account are already committed above, and this runs inside a top-level
-  // browser redirect: throwing here (or hanging on an unreachable SMTP host)
-  // surfaces to the visitor as a dead-end 504 from the frontend proxy, with no
-  // way back into the flow. Proceeding still returns requiresVerification, so
-  // the UI shows the code prompt and its resend button — which is the documented
-  // recovery path in resendVerificationCode.
-  try {
-    await sendVerificationCode(googleUser.email.toLowerCase().trim(), config);
-  } catch (err) {
-    console.error(
-      `❌ Google sign-in linked ${googleUser.email} but the verification email failed to send:`,
-      err,
-    );
+  // Step 4: Google already confirmed this identity and email ownership — no
+  // app-owned OTP is needed, so a session is issued immediately. Still gate on
+  // account status, same as password signin, so a banned/inactive account can't
+  // bypass that check by going through Google instead.
+  const user = await findUserById(db, userId);
+  if (!user) throw createDataError('INTERNAL_ERROR', 'Could not load the signed-in account.');
+  if (user.status === 'BANNED' || user.status === 'INACTIVE') {
+    throw createDataError('FORBIDDEN', 'Your account has been suspended.');
   }
+
+  if (client === 'console') {
+    // Same staff gate createConsoleHandoff applies to an existing session —
+    // there is no session yet here, so it is inlined rather than reused.
+    const assignments = await getUserRoleAssignments(getAppDb(), userId);
+    if (!assignments.some((a) => ['ADMIN', 'ORGANIZER', 'SCANNER'].includes(a.role))) {
+      throw createDataError('FORBIDDEN', 'This account does not have console access.');
+    }
+    if (user.mustChangePassword) {
+      throw createDataError(
+        'MUST_CHANGE_PASSWORD',
+        'Change the temporary password before opening the console.',
+      );
+    }
+    const handoffCode = await createHandoffCode(getWriterDb(), { userId, returnTo });
+    const redirectUrl =
+      `${config.REGISTRATION_CONSOLE_URL.replace(/\/$/, '')}/auth/callback` +
+      `?code=${encodeURIComponent(handoffCode)}&returnTo=${encodeURIComponent(returnTo)}`;
+    return {
+      user: { id: userId, email: googleUser.email },
+      requiresVerification: false,
+      returnTo,
+      redirectUrl,
+    };
+  }
+
+  const credentials = await createSessionAndIssueCredentials(userId, reply, config, 'cookie');
 
   return {
     user: { id: userId, email: googleUser.email },
-    requiresVerification: true,
+    requiresVerification: false,
     returnTo,
+    ...(credentials ?? {}),
   };
 }

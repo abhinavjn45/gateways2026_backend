@@ -52,8 +52,6 @@ export const accounts = mysqlTable(
     type: varchar('type', { length: 255 }).notNull(),
     provider: varchar('provider', { length: 255 }).notNull(),
     providerAccountId: varchar('provider_account_id', { length: 255 }).notNull(),
-    refreshToken: text('refresh_token'),
-    accessToken: text('access_token'),
     expiresAt: bigint('expires_at', { mode: 'number' }),
     tokenType: varchar('token_type', { length: 255 }),
     scope: varchar('scope', { length: 255 }),

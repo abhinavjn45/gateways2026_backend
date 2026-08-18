@@ -23,6 +23,20 @@ import { withTransaction } from '../db/transaction.js';
 import { createDataError } from '../errors/DataError.js';
 import { ensureDefaultCharacter } from './characters.repository.js';
 
+/**
+ * Generate a participant code.
+ *
+ * Deliberately NOT derived from the user's UUID. This used to slice the first
+ * 8 hex characters off a uuidv7 id, but a v7 UUID's leading bits are a
+ * millisecond timestamp, not randomness — every id minted in the same ~65s
+ * window shares that prefix. Any two people who signed up close together
+ * collided on profiles_participant_code_unique and the second one's signup
+ * 500'd. random bytes have no such shared structure.
+ */
+function generateParticipantCode(): string {
+  return `GWS26-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+}
+
 type Db = MySql2Database<typeof schema>;
 
 // ─── Exported User Types ───────────────────────────────────────────────────────
@@ -108,6 +122,13 @@ export async function createUser(
     passwordHash?: string;
     fullName?: string;
     mustChangePassword?: boolean;
+    /**
+     * Verification timestamp, or null to leave the account unverified.
+     * Callers decide: signup passes a date when REQUIRE_EMAIL_VERIFICATION is
+     * off, null when it is on. Defaults to null so an omission cannot silently
+     * mark an account verified.
+     */
+    emailVerified?: Date | null;
   },
 ): Promise<string> {
   await withTransaction(db, async (tx) => {
@@ -126,11 +147,12 @@ export async function createUser(
       email: params.email.toLowerCase(),
       passwordHash: params.passwordHash ?? null,
       status: 'ACTIVE',
+      emailVerified: params.emailVerified ?? null,
       mustChangePassword: params.mustChangePassword ?? false,
     });
     await tx.insert(profiles).values({
       userId: params.id,
-      participantCode: `GWS26-${params.id.slice(0, 8).toUpperCase()}`,
+      participantCode: generateParticipantCode(),
       fullName: params.fullName?.trim() || username,
     });
     await tx.insert(characters).values({
@@ -147,6 +169,93 @@ export async function createUser(
     });
   });
   return params.id;
+}
+
+/**
+ * Mark verified AND consume the OTP in one transaction.
+ *
+ * These were two independent statements fired through Promise.all, which is
+ * concurrency, not atomicity: if the consume failed after the mark succeeded,
+ * a spent code stayed live until it expired.
+ */
+export async function verifyEmailAtomically(
+  db: Db,
+  params: { userId: string; email: string; purpose?: string },
+): Promise<void> {
+  const purpose = params.purpose ?? 'EMAIL_VERIFICATION';
+  await withTransaction(db, async (tx) => {
+    await tx.update(users).set({ emailVerified: sql`now()` }).where(eq(users.id, params.userId));
+    await tx
+      .delete(verificationTokens)
+      .where(
+        and(
+          eq(verificationTokens.identifier, params.email),
+          eq(verificationTokens.purpose, purpose),
+        ),
+      );
+  });
+}
+
+/**
+ * Re-point an existing unverified account at new credentials.
+ *
+ * Used by the signup re-try path: the address was never verified, so nobody
+ * has proven ownership and there is no account worth protecting — overwriting
+ * is safer than stranding the address forever behind EMAIL_TAKEN.
+ *
+ * Single transaction so a taken username cannot leave a rotated password
+ * behind on a half-updated account.
+ */
+export async function resetUserCredentials(
+  db: Db,
+  params: { userId: string; passwordHash: string; username: string; fullName?: string },
+): Promise<void> {
+  await withTransaction(db, async (tx) => {
+    const username = params.username.trim();
+
+    // Same uniqueness rule as createUser — scoped to OTHER users, so reusing
+    // your own existing username on a retry is not a conflict.
+    const clash = await tx
+      .select({ userId: characters.userId })
+      .from(characters)
+      .where(eq(sql`LOWER(${characters.playerName})`, username.toLowerCase()))
+      .limit(1);
+    if (clash[0] && clash[0].userId !== params.userId) {
+      throw createDataError('PLAYER_NAME_TAKEN', 'That username is already taken.');
+    }
+
+    await tx
+      .update(users)
+      .set({ passwordHash: params.passwordHash, mustChangePassword: false })
+      .where(eq(users.id, params.userId));
+
+    await tx
+      .update(characters)
+      .set({ playerName: username })
+      .where(eq(characters.userId, params.userId));
+
+    if (params.fullName?.trim()) {
+      await tx
+        .update(profiles)
+        .set({ fullName: params.fullName.trim() })
+        .where(eq(profiles.userId, params.userId));
+    }
+  });
+}
+
+/**
+ * Does this user have a linked OAuth identity?
+ *
+ * Used to refuse password signup/change on a Google-backed account, so a
+ * password can never be grafted onto an identity Google owns.
+ */
+export async function hasLinkedOAuthAccount(db: Db, userId: string): Promise<boolean> {
+  const rows = await db
+    .select({ id: accounts.id })
+    .from(accounts)
+    .where(eq(accounts.userId, userId))
+    .limit(1);
+  return Boolean(rows[0]);
 }
 
 /**
@@ -429,8 +538,6 @@ export async function upsertOAuthAccount(
     .values(params)
     .onDuplicateKeyUpdate({
       set: {
-        refreshToken: params.refreshToken,
-        accessToken: params.accessToken,
         expiresAt: params.expiresAt,
         idToken: params.idToken,
         scope: params.scope,
@@ -460,8 +567,6 @@ export async function findOrCreateOAuthUser(
     googleProfile: {
       name?: string;
       picture?: string;
-      accessToken?: string;
-      refreshToken?: string;
       expiresAt?: number;
       idToken?: string;
       scope?: string;
@@ -479,8 +584,6 @@ export async function findOrCreateOAuthUser(
         type: 'oauth',
         provider: params.provider,
         providerAccountId: params.providerAccountId,
-        accessToken: params.googleProfile.accessToken,
-        refreshToken: params.googleProfile.refreshToken ?? null,
         expiresAt: params.googleProfile.expiresAt ?? null,
         idToken: params.googleProfile.idToken ?? null,
         scope: params.googleProfile.scope ?? null,
@@ -500,22 +603,25 @@ export async function findOrCreateOAuthUser(
     let targetUserId: string;
 
     if (existingUserRows[0]) {
-      // Link OAuth account to existing manual account
+      // Link OAuth account to existing manual account. Google has verified this
+      // same email address, so a manual account still pending its own OTP is
+      // now considered verified too.
       targetUserId = existingUserRows[0].id;
+      await markEmailVerified(tx as Db, targetUserId);
     } else {
-      // Step 3: brand new user — Google identifies the account, but the app
-      // still requires its own one-time verification code before issuing a
-      // session. This keeps Google and password signup on one verification path.
+      // Step 3: brand new user. Google has already verified this email address
+      // (checked by the caller before this transaction starts), so it is marked
+      // verified immediately — no app-owned OTP round-trip needed.
       await (tx as Db).insert(users).values({
         id: params.userId,
         email: params.email.toLowerCase(),
         passwordHash: null,
         status: 'ACTIVE',
-        emailVerified: null,
+        emailVerified: new Date(),
       });
       await (tx as Db).insert(profiles).values({
         userId: params.userId,
-        participantCode: `GWS26-${params.userId.slice(0, 8).toUpperCase()}`,
+        participantCode: generateParticipantCode(),
         fullName: params.googleProfile.name?.trim() || params.email.split('@')[0],
       });
       await (tx as Db).insert(userRoles).values({
@@ -542,8 +648,6 @@ export async function findOrCreateOAuthUser(
       type: 'oauth',
       provider: params.provider,
       providerAccountId: params.providerAccountId,
-      accessToken: params.googleProfile.accessToken ?? null,
-      refreshToken: params.googleProfile.refreshToken ?? null,
       expiresAt: params.googleProfile.expiresAt ?? null,
       idToken: params.googleProfile.idToken ?? null,
       scope: params.googleProfile.scope ?? null,

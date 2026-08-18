@@ -73,6 +73,8 @@ export const GoogleCallbackQuerySchema = z.object({
 
 export const GoogleOAuthInitQuerySchema = z.object({
   returnTo: z.string().regex(/^\/(?!\/)/).max(200).optional(),
+  /** 'console' routes the callback to the registration console instead of the website. */
+  client: z.enum(['website', 'console']).optional(),
 });
 
 export const UserIdParamSchema = z.object({
@@ -91,8 +93,40 @@ export const PublicUserSchema = z.object({
   updatedAt: z.string(),
 });
 
+/**
+ * Bearer credentials, present only when the caller sent `X-Auth-Transport: bearer`
+ * (admin dashboard, mobile). Cookie callers get neither field — the token stays in
+ * the httpOnly Set-Cookie header and never enters a JS-readable body.
+ *
+ * These must be declared here: the Zod serializer strips any field absent from the
+ * response schema, so an undeclared token would be silently dropped.
+ */
+const BearerCredentialFields = {
+  token: z.string().optional(),
+  expiresAt: z.string().optional(),
+};
+
+/**
+ * NOTE: the Zod serializer DROPS any field absent from this schema, silently and
+ * with no error. Every field signupWithPassword returns must be declared here or
+ * it will not reach the client.
+ */
 export const SignupResponseSchema = z.object({
+  /**
+   * ACTIVE means a session was issued with this response — the caller is signed
+   * in and must not be sent to a verification screen. The two VERIFICATION_*
+   * values distinguish "code sent" from "code could NOT be sent", so the UI can
+   * stop claiming a delivery that did not happen.
+   */
+  status: z.enum(['ACTIVE', 'VERIFICATION_SENT', 'VERIFICATION_PENDING']),
   message: z.string(),
+  user: z
+    .object({
+      id: z.string(),
+      email: z.string(),
+    })
+    .optional(),
+  ...BearerCredentialFields,
 });
 
 export const ResendVerificationBodySchema = z.object({
@@ -122,18 +156,6 @@ export const PasswordResetResponseSchema = z.object({
   message: z.string(),
 });
 
-/**
- * Bearer credentials, present only when the caller sent `X-Auth-Transport: bearer`
- * (admin dashboard, mobile). Cookie callers get neither field — the token stays in
- * the httpOnly Set-Cookie header and never enters a JS-readable body.
- *
- * These must be declared here: the Zod serializer strips any field absent from the
- * response schema, so an undeclared token would be silently dropped.
- */
-const BearerCredentialFields = {
-  token: z.string().optional(),
-  expiresAt: z.string().optional(),
-};
 
 export const VerifyEmailResponseSchema = z.object({
   message: z.string(),
@@ -152,6 +174,23 @@ export const SigninResponseSchema = z.object({
   ...BearerCredentialFields,
 });
 
+/**
+ * Admin/console signin response.
+ *
+ * Separate from SigninResponseSchema on purpose: that one is shared by
+ * /auth/signin, /auth/change-password and the Google callback, so adding
+ * mustChangePassword there would publish account state onto three participant
+ * routes that have no business carrying it.
+ */
+export const AdminSigninResponseSchema = z.object({
+  user: z.object({
+    id: z.string(),
+    email: z.string(),
+    mustChangePassword: z.boolean(),
+  }),
+  ...BearerCredentialFields,
+});
+
 export const SessionResponseSchema = z.object({
   user: z.object({
     id: z.string(),
@@ -164,6 +203,8 @@ export const SessionResponseSchema = z.object({
     role: z.string(),
     eventScopeId: z.string().nullable(),
   })),
+  /** The session's real expiry, from the DB row — not a client-side guess. */
+  expiresAt: z.string().optional(),
 });
 
 export const SignoutResponseSchema = z.object({

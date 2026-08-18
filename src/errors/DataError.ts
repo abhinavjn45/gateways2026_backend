@@ -16,6 +16,8 @@ export type DataErrorCode =
   | 'PAYMENT_NOT_VERIFIED'
   | 'FORBIDDEN'
   | 'MUST_CHANGE_PASSWORD'
+  | 'EMAIL_NOT_VERIFIED'
+  | 'OAUTH_ACCOUNT'
   | 'INTERNAL_ERROR';
 
 export interface DataErrorDetails {
@@ -60,6 +62,11 @@ export const ERROR_MAPPINGS: Record<DataErrorCode, { statusCode: number; retryab
   TEAM_LOCKED: { statusCode: 409, retryable: false },
   INVALID_JOIN_CODE: { statusCode: 409, retryable: false },
   RECEIPT_ALREADY_SUBMITTED: { statusCode: 409, retryable: false },
+  // 409 rather than 403: FORBIDDEN/MUST_CHANGE_PASSWORD mean "you may not",
+  // whereas both of these mean "the account is in a state this request can't
+  // use" and are recoverable by the caller taking a different route.
+  EMAIL_NOT_VERIFIED: { statusCode: 409, retryable: false },
+  OAUTH_ACCOUNT: { statusCode: 409, retryable: false },
   REGISTRATION_CLOSED: { statusCode: 422, retryable: false },
   EVENT_FULL: { statusCode: 422, retryable: false },
   PAYMENT_NOT_VERIFIED: { statusCode: 422, retryable: false },
@@ -92,6 +99,8 @@ export function createDataError(
     PAYMENT_NOT_VERIFIED: 'Action requires a verified payment.',
     FORBIDDEN: 'You do not have permission to perform this action.',
     MUST_CHANGE_PASSWORD: 'You must change your temporary password before continuing.',
+    EMAIL_NOT_VERIFIED: 'Please verify your email address to continue. We sent you a new code.',
+    OAUTH_ACCOUNT: 'This account signs in with Google. Use the Google button instead.',
     INTERNAL_ERROR: 'An internal server error occurred. Please try again later.',
   };
 

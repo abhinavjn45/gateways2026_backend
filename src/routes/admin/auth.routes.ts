@@ -18,7 +18,7 @@ import { z } from 'zod';
 import type { AppConfig } from '../../config/env.js';
 import { assertAuthenticated } from '../../plugins/jwt-auth.js';
 import { ANONYMOUS_ACTOR, auditRequest } from '../../repositories/audit-log.repository.js';
-import { findUserByEmail } from '../../repositories/auth.repository.js';
+import { findUserByEmail, findUserById } from '../../repositories/auth.repository.js';
 import { getUserRoles } from '../../repositories/user-roles.repository.js';
 import { getAppDb } from '../../db/index.js';
 import { createDataError } from '../../errors/DataError.js';
@@ -30,7 +30,11 @@ import {
   signoutEverywhere,
   verifyPasswordCredentials,
 } from '../../services/auth.service.js';
-import { SigninBodySchema, SigninResponseSchema } from '../../schemas/auth.schemas.js';
+import {
+  SigninBodySchema,
+  SigninResponseSchema,
+  AdminSigninResponseSchema,
+} from '../../schemas/auth.schemas.js';
 
 const ErrorResponseSchema = z.object({
   error: z.object({
@@ -100,7 +104,7 @@ export async function registerAdminAuthRoutes(app: FastifyInstance, config: AppC
           'in the response body instead of a cookie (required for cross-origin clients).',
         body: SigninBodySchema,
         response: {
-          200: SigninResponseSchema,
+          200: AdminSigninResponseSchema,
           401: ErrorResponseSchema,
           403: ErrorResponseSchema,
         },
@@ -121,17 +125,36 @@ export async function registerAdminAuthRoutes(app: FastifyInstance, config: AppC
         throw error;
       }
 
+      // Any staff role opens this door, not ADMIN alone. The dashboard signs in
+      // here directly now, and it is built for all three: ORGANIZER maps to
+      // "coordinator" and SCANNER to "desk" in its own role model. Gating on
+      // ADMIN would lock out the people who actually work the desk.
+      //
+      // This deliberately matches GET /admin/auth/session, which has always
+      // admitted the same set via assertStaff — the two were inconsistent, so a
+      // staff member could hold a valid session this route refused to issue.
+      const STAFF_ROLES: readonly string[] = [
+        UserRole.ADMIN,
+        UserRole.ORGANIZER,
+        UserRole.SCANNER,
+      ];
+
       const roles = await getUserRoles(db, user.id);
-      if (!roles.includes(UserRole.ADMIN)) {
+      if (!roles.some((role) => STAFF_ROLES.includes(role))) {
         await auditRequest(request, {
           action: 'admin_signin_failed',
           targetType: 'user',
           targetId: user.id,
           actorUserId: user.id,
-          metadata: { reason: 'not_an_admin', ip: request.ip },
+          metadata: { reason: 'not_staff', ip: request.ip },
         });
-        throw createDataError('FORBIDDEN', 'This account is not an administrator.');
+        throw createDataError('FORBIDDEN', 'This account does not have console access.');
       }
+
+      // Read before the session exists so the dashboard can branch straight to
+      // its set-password screen without a second round-trip.
+      const account = await findUserById(db, user.id);
+      const mustChangePassword = account?.mustChangePassword ?? false;
 
       const credentials = await issueSessionFor(
         user.id,
@@ -150,7 +173,10 @@ export async function registerAdminAuthRoutes(app: FastifyInstance, config: AppC
         metadata: { ip: request.ip },
       });
 
-      return reply.send({ user, ...(credentials ?? {}) });
+      return reply.send({
+        user: { ...user, mustChangePassword },
+        ...(credentials ?? {}),
+      });
     },
   );
 

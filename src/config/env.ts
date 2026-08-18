@@ -122,6 +122,23 @@ const envSchema = z.object({
   // Session
   SESSION_MAX_AGE_DAYS: z.coerce.number().default(7),
 
+  /**
+   * Gate signup behind an emailed one-time code.
+   *
+   * OFF by default, and currently off everywhere: SMTP is not provisioned, and
+   * a verification step that cannot deliver its code is a permanent lockout —
+   * the account is committed, signin refuses an unverified user, and signup
+   * refuses a duplicate address. Creating users already-verified removes that
+   * failure mode entirely rather than papering over it.
+   *
+   * The OTP machinery below is still built, tested and reachable, so switching
+   * this back on once SMTP exists is a config change, not a code change.
+   *
+   * Uses booleanEnv() deliberately: z.coerce.boolean() maps the string "false"
+   * to true, which would make this flag impossible to turn off from a .env file.
+   */
+  REQUIRE_EMAIL_VERIFICATION: booleanEnv().default(false),
+
   // OTP
   OTP_EXPIRY_MINUTES: z.coerce.number().default(15),
   PASSWORD_RESET_EXPIRY_MINUTES: z.coerce.number().int().positive().default(30),

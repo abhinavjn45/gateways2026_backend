@@ -32,18 +32,16 @@ export type UserRole = (typeof UserRole)[keyof typeof UserRole];
 // ─── assertAuthenticated ──────────────────────────────────────────────────────
 
 /**
- * Throws NOT_AUTHENTICATED (401) if the session hook has not decorated
- * request.user. Call this at the top of any protected route handler.
+ * Re-exported from the session plugin, which owns it.
  *
- * Safe to use immediately — requires only the auth schema.
+ * This module used to define a byte-identical second copy. Two guards with the
+ * same name and the same job is how they drift: a fix applied to one silently
+ * leaves the other in place, and callers cannot tell which they imported. The
+ * plugin's copy wins because that is where request.user is set, so the guard
+ * and the thing it guards live together.
  */
-export function assertAuthenticated(request: FastifyRequest): asserts request is FastifyRequest & {
-  user: NonNullable<FastifyRequest['user']>;
-} {
-  if (!request.user) {
-    throw createDataError('NOT_AUTHENTICATED');
-  }
-}
+export { assertAuthenticated } from '../plugins/jwt-auth.js';
+import { assertAuthenticated } from '../plugins/jwt-auth.js';
 
 // ─── assertAdmin ──────────────────────────────────────────────────────────────
 

@@ -48,6 +48,10 @@ export const CSRF_EXEMPT_PATHS: ReadonlySet<string> = new Set([
   `${API_V1_PREFIX}/auth/reset-password`,
   `${API_V1_PREFIX}/auth/callback/google`,
   `${API_V1_PREFIX}/auth/console-handoff/exchange`,
+  // Called by the website with no session and no csrf_token cookie. It only
+  // worked because the browser happened to still hold a token from a previous
+  // login; a first-time visitor hit a 400 before the handler ever ran.
+  `${API_V1_PREFIX}/auth/website-handoff/exchange`,
   `${ADMIN_PREFIX}/auth/signin`,
 
   // Machine-to-machine, called by a Google Apps Script onEdit trigger. It has no

@@ -58,6 +58,13 @@ declare module 'fastify' {
      * malformed Authorization header must never leave it set.
      */
     authTransport?: AuthTransport;
+    /**
+     * ISO timestamp of the current session row's expiry. Set alongside
+     * request.user so GET /auth/session can return the server's real value
+     * instead of a client having to invent one from a fixed session lifetime
+     * that may not match (e.g. after a slide, or a shorter bearer window).
+     */
+    sessionExpiresAt?: string;
   }
 }
 
@@ -160,6 +167,15 @@ export async function registerSessionHook(app: FastifyInstance): Promise<void> {
       mustChangePassword: user.mustChangePassword,
     };
     request.authTransport = extracted.transport;
+    // Read the (possibly just-slid) expiry, not the pre-slide value captured
+    // above in `expiresMs` — the slide already happened by this point.
+    request.sessionExpiresAt = (
+      extracted.transport === 'cookie' && expiresMs - now < SLIDE_THRESHOLD_MS
+        ? new Date(now + SESSION_MAX_AGE_MS)
+        : session.expires instanceof Date
+          ? session.expires
+          : new Date(session.expires)
+    ).toISOString();
 
     // Store raw token for signout (needed to call deleteSession with the hash)
     request._rawSessionToken = rawToken;

@@ -4,6 +4,9 @@
   "description": "Standalone backend service for Gateways — our CS department's flagship fest website and companion mobile app.",
   "main": "dist/app.js",
   "packageManager": "npm@10.9.2",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "dev": "tsx watch src/app.ts",
     "dev:all": "tsx scripts/dev-with-db.ts",
@@ -46,6 +49,7 @@
     "@fastify/rate-limit": "^11.2.0",
     "@fastify/swagger": "^9.8.1",
     "@fastify/swagger-ui": "^6.1.1",
+    "@node-rs/argon2": "^2.1.0",
     "bcryptjs": "^3.0.3",
     "cloudinary": "^2.10.0",
     "dotenv": "^17.4.2",

@@ -13,7 +13,7 @@
  *   POST   /auth/signout              — revoke every session (website + console) + clear cookies  [auth required]
  *   GET    /auth/session              — return current user             [auth required]
  *   GET    /auth/signin/google        — redirect to Google OAuth
- *   GET    /auth/callback/google      — Google OAuth callback → sends OTP
+ *   GET    /auth/callback/google      — Google OAuth callback → issues session directly
  *   POST   /auth/admin/roles/:userId  — grant role                      [auth + ADMIN]
  *   POST   /auth/console-handoff      — website → console handoff       [auth required]
  *   POST   /auth/console-handoff/exchange — exchange console handoff (bearer)
@@ -110,8 +110,10 @@ export async function registerAuthRoutes(app: FastifyInstance, config: AppConfig
         tags: ['Authentication'],
         summary: 'Register a new account (manual / password)',
         description:
-          'Creates a new user account. Sends a 6-digit OTP to the provided email. ' +
-          'The user must call POST /auth/verify-email to complete registration and receive a session.',
+          'Creates a new user account. With REQUIRE_EMAIL_VERIFICATION off (current default) ' +
+          'the account is created verified and a session is issued with this response ' +
+          '(status ACTIVE). With the flag on, a 6-digit OTP is sent instead and the caller ' +
+          'must complete POST /auth/verify-email before signing in.',
         body: SignupBodySchema,
         response: {
           201: SignupResponseSchema,
@@ -121,7 +123,14 @@ export async function registerAuthRoutes(app: FastifyInstance, config: AppConfig
       },
     },
     async (request, reply) => {
-      const result = await signupWithPassword(request.body, config);
+      // reply is handed down so the service can set the session cookie itself;
+      // transport mirrors signin so a bearer client gets a token, not a cookie.
+      const result = await signupWithPassword(
+        request.body,
+        config,
+        reply,
+        resolveRequestedTransport(request),
+      );
       return reply.status(201).send(result);
     },
   );
@@ -287,6 +296,7 @@ export async function registerAuthRoutes(app: FastifyInstance, config: AppConfig
     async (request, reply) => {
       const user = getSession(request);
       return reply.send({
+        expiresAt: request.sessionExpiresAt,
         user: {
           id: user.id,
           email: user.email,
@@ -433,7 +443,12 @@ export async function registerAuthRoutes(app: FastifyInstance, config: AppConfig
       },
     },
     async (request, reply) => {
-      const result = initiateGoogleOAuth(config, reply, request.query.returnTo);
+      const result = initiateGoogleOAuth(
+        config,
+        reply,
+        request.query.returnTo,
+        request.query.client,
+      );
       return reply.send(result);
     },
   );
@@ -447,8 +462,8 @@ export async function registerAuthRoutes(app: FastifyInstance, config: AppConfig
         summary: 'Google OAuth callback handler',
         description:
           'Receives the authorization code from Google, exchanges it for tokens, ' +
-          'finds or creates the user account, sends the app-owned email verification code, ' +
-          'and redirects to the website verification screen. No session is issued until OTP verification.',
+          'finds or creates the user account, and issues a session immediately — ' +
+          'Google has already verified the email address, so no app-owned OTP step runs.',
         querystring: GoogleCallbackQuerySchema,
         response: {
           200: SigninResponseSchema,
@@ -469,15 +484,14 @@ export async function registerAuthRoutes(app: FastifyInstance, config: AppConfig
       }
 
       const result = await handleGoogleCallback(code, request, reply, config, state);
-      // The callback is reached by a browser through the website's same-origin
-      // API proxy. Redirect after the backend sets the cookie so the user lands
-      // back in the app instead of seeing the raw JSON response. `result` is
-      // retained for the service contract and non-browser callers can still use
-      // the handler directly in tests.
-      const target = result.requiresVerification
-        ? `/login?google=verify&email=${encodeURIComponent(result.user.email)}&next=${encodeURIComponent(result.returnTo)}`
-        : result.returnTo;
-      return reply.redirect(`${config.FRONTEND_BASE_URL.replace(/\/$/, '')}${target}`, 303);
+      // Console flow: no cookie was set on this response, redirectUrl carries a
+      // one-time handoff code the console exchanges for its own bearer token.
+      if (result.redirectUrl) {
+        return reply.redirect(result.redirectUrl, 303);
+      }
+      // Website flow: the cookie is already set on this response. Redirect so
+      // the user lands back in the app instead of seeing the raw JSON response.
+      return reply.redirect(`${config.FRONTEND_BASE_URL.replace(/\/$/, '')}${result.returnTo}`, 303);
     },
   );
 
