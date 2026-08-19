@@ -182,27 +182,20 @@ async function sendVerificationCode(
     purpose: 'EMAIL_VERIFICATION',
   });
 
-  // ── SMTP DISABLED ─────────────────────────────────────────────────────────
-  // Mail is not provisioned, and REQUIRE_EMAIL_VERIFICATION is off, so nothing
-  // reaches this in normal operation. Re-enable together with that flag.
-  //
-  // try {
-  //   await emailService.sendVerificationEmail({ to: email, verificationToken: otp });
-  //   return { delivered: true };
-  // } catch (error) {
-  //   // Never leak SMTP details or the OTP to the browser.
-  //   console.error(
-  //     'Verification email delivery failed:',
-  //     error instanceof Error ? error.message : String(error),
-  //   );
-  //   return { delivered: false };
-  // }
-  // ──────────────────────────────────────────────────────────────────────────
-
-  // Returning `false` rather than throwing is the whole point: the caller
-  // reports "created, code not sent" and keeps a recovery path open, instead
-  // of 500-ing on a committed account.
-  return { delivered: false };
+  try {
+    await emailService.sendVerificationEmail({ to: email, verificationToken: otp });
+    return { delivered: true };
+  } catch (error) {
+    // Never leak SMTP/relay details or the OTP to the browser.
+    console.error(
+      'Verification email delivery failed:',
+      error instanceof Error ? error.message : String(error),
+    );
+    // Returning `false` rather than throwing is the whole point: the caller
+    // reports "created, code not sent" and keeps a recovery path open, instead
+    // of 500-ing on a committed account.
+    return { delivered: false };
+  }
 }
 
 // ─── 1. Sign Up (Password) ───────────────────────────────────────────────────

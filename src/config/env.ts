@@ -102,6 +102,16 @@ const envSchema = z.object({
   SMTP_FALLBACK_SECURE: booleanEnv(),
   SMTP_FALLBACK_FROM: z.string().optional(),
 
+  /**
+   * HTTP mail relay, tried before SMTP in email.service.ts. Exists because
+   * outbound SMTP (25/465/587) is blocked on many PaaS hosts, including
+   * Render — the SMTP transporters below can only ever time out there. The
+   * relay is a plain HTTP POST target; nothing PHP-specific runs in this
+   * process, "PHP" only names what's running behind that URL.
+   */
+  PHP_MAILER_URL: z.string().url().optional(),
+  PHP_MAILER_API_KEY: z.string().optional(),
+
   STORAGE_BUCKET_URL: z.string().optional(),
   STORAGE_ACCESS_KEY: z.string().optional(),
   STORAGE_SECRET_KEY: z.string().optional(),

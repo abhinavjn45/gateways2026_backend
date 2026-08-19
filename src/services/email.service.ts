@@ -8,6 +8,14 @@ export interface EmailOptions {
   subject: string;
   html: string;
   text?: string;
+  /**
+   * The bare code, when this email carries one.
+   *
+   * Only used by the HTTP relay, which also receives it as a top-level `otp`
+   * field so a PHP script written against the older `{ email, otp }` contract
+   * keeps working unchanged. SMTP ignores it entirely.
+   */
+  otp?: string;
 }
 
 export interface EmailVerificationOptions {
@@ -166,9 +174,67 @@ class EmailService {
     }
   }
 
-  public async sendEmail(options: EmailOptions): Promise<{ success: boolean; provider: 'primary' | 'fallback' | 'dev_log' }> {
+  /**
+   * Deliver over HTTPS instead of SMTP.
+   *
+   * The payload is a SUPERSET on purpose: `to`/`subject`/`html`/`text` let the
+   * relay act as a dumb sender for any message we compose (including the
+   * password-reset LINK, which has no code in it), while `email` and `otp`
+   * mirror the older `{ email, otp }` contract so a script written against that
+   * still delivers verification codes without being touched.
+   *
+   * Templates stay here rather than in PHP. Two copies of every email on two
+   * servers in two languages would drift, and this service already builds both.
+   */
+  private async sendViaRelay(options: EmailOptions, from: string): Promise<boolean> {
+    const url = this.config.PHP_MAILER_URL;
+    if (!url) return false;
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(this.config.PHP_MAILER_API_KEY ? { 'X-API-Key': this.config.PHP_MAILER_API_KEY } : {}),
+        },
+        body: JSON.stringify({
+          to: options.to,
+          email: options.to,
+          from,
+          subject: options.subject,
+          html: options.html,
+          text: options.text,
+          ...(options.otp ? { otp: options.otp } : {}),
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      if (!res.ok) {
+        // The relay's body can echo configuration, so it is logged here and
+        // never propagated to the caller.
+        const detail = (await res.text().catch(() => '')).slice(0, 300);
+        console.error(`❌ Mail relay responded ${res.status}: ${detail}`);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      console.error('❌ Mail relay unreachable:', err instanceof Error ? err.message : String(err));
+      return false;
+    }
+  }
+
+  public async sendEmail(options: EmailOptions): Promise<{ success: boolean; provider: 'relay' | 'primary' | 'fallback' | 'dev_log' }> {
     const primaryFrom = this.config.SMTP_FROM || this.config.SMTP_USER || 'noreply@gateways2026.com';
     const fallbackFrom = this.config.SMTP_FALLBACK_FROM || this.config.SMTP_FALLBACK_USER || primaryFrom;
+
+    // 0. HTTP relay first when configured — on a host that blocks SMTP the
+    //    transporters below can only ever time out.
+    if (this.config.PHP_MAILER_URL) {
+      if (await this.sendViaRelay(options, primaryFrom)) {
+        return { success: true, provider: 'relay' };
+      }
+      console.warn('⚠️ Mail relay failed. Falling through to SMTP...');
+    }
 
     // 1. Try Primary SMTP
     if (this.primaryTransporter) {
@@ -253,6 +319,8 @@ class EmailService {
       subject: 'Verify your email for Gateways 2026',
       html,
       text,
+      // Mirrors the older { email, otp } relay contract.
+      otp: options.verificationToken,
     });
   }
 
