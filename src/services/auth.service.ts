@@ -160,28 +160,41 @@ async function createSessionAndIssueCredentials(
 // ─── Email Verification ------------------------------------------------------
 
 /**
- * Create and deliver the one-time code used by both password and Google
- * account flows. The token is stored before delivery so a transient SMTP
- * failure can be recovered by requesting another code without recreating the
- * account.
+ * Generate and store a fresh OTP for `email`. A DB write only — no network
+ * call — so this is fast and safe to always `await`.
+ *
+ * Deliberately split from delivery (below): the token must exist before any
+ * caller can plausibly respond "check your email", but the actual send must
+ * NOT be awaited on the same timeline — see deliverVerificationEmail.
  */
-async function sendVerificationCode(
-  email: string,
-  config: AppConfig,
-): Promise<{ delivered: boolean }> {
+async function issueVerificationToken(email: string, config: AppConfig): Promise<string> {
   const otp = generateOtp();
   const hashedOtp = await hashOtp(otp);
   const otpExpires = new Date(Date.now() + config.OTP_EXPIRY_MINUTES * 60 * 1000);
 
-  // Stored BEFORE any delivery attempt, so a failed send still leaves a token
-  // that "resend" can replace and the user can eventually enter.
+  // Stored BEFORE any delivery attempt, so a failed/slow send still leaves a
+  // token that "resend" can replace and the user can eventually enter.
   await upsertVerificationToken(getWriterDb(), {
     identifier: email,
     hashedOtp,
     expires: otpExpires,
     purpose: 'EMAIL_VERIFICATION',
   });
+  return otp;
+}
 
+/**
+ * Attempt to deliver `otp` to `email`. Never throws.
+ *
+ * Confirmed against the deployed backend: the relay+SMTP+SMTP-fallback chain
+ * in emailService.sendEmail can take far longer than a PaaS platform's own
+ * proxy timeout (Render kills the connection with zero bytes returned, well
+ * before the chain finishes) — so nothing in the HTTP response path may
+ * `await` this. Callers that can afford to wait still may; callers that
+ * cannot (see signupWithPassword, resendVerificationCode) fire this without
+ * awaiting and let it resolve after the response has already gone out.
+ */
+async function deliverVerificationEmail(email: string, otp: string): Promise<{ delivered: boolean }> {
   try {
     await emailService.sendVerificationEmail({ to: email, verificationToken: otp });
     return { delivered: true };
@@ -198,6 +211,22 @@ async function sendVerificationCode(
   }
 }
 
+/**
+ * Issue + deliver a code, waiting for both steps. Only safe for callers that
+ * genuinely do not mind blocking on mail delivery — currently none of the
+ * HTTP-response paths in this file do; they use issueVerificationToken +
+ * deliverVerificationEmail split instead. Kept for the one background
+ * reissue-on-login-attempt caller below, which already does not block a
+ * response on it either way.
+ */
+async function sendVerificationCode(
+  email: string,
+  config: AppConfig,
+): Promise<{ delivered: boolean }> {
+  const otp = await issueVerificationToken(email, config);
+  return deliverVerificationEmail(email, otp);
+}
+
 // ─── 1. Sign Up (Password) ───────────────────────────────────────────────────
 
 export interface SignupDto {
@@ -210,8 +239,20 @@ export interface SignupDto {
 export interface SignupResult {
   /**
    * ACTIVE            — account usable now, session issued alongside.
-   * VERIFICATION_SENT — code delivered, caller must verify before signing in.
-   * VERIFICATION_PENDING — account exists but the code did NOT go out.
+   * VERIFICATION_SENT — code issued, delivery is in flight; caller must
+   *                      verify before signing in. "In flight" rather than
+   *                      "confirmed delivered": actual mail delivery is never
+   *                      awaited in the response path (see
+   *                      deliverVerificationEmail) because it can take far
+   *                      longer than a PaaS platform's own proxy timeout —
+   *                      confirmed against the deployed backend on Render,
+   *                      where the client received nothing at all because the
+   *                      edge closed the connection before a slow relay+SMTP
+   *                      chain could finish. "Resend code" is always there if
+   *                      delivery silently fails.
+   * VERIFICATION_PENDING — reserved for a future synchronous "nothing is
+   *                      configured to send mail at all" pre-check; no
+   *                      current code path returns it.
    *
    * Machine-readable on purpose. This used to be prose only, so the website
    * could not tell "we emailed you" from "we could not email you" and printed
@@ -268,12 +309,16 @@ export async function signupWithPassword(
       username: dto.username,
       fullName: dto.fullName,
     });
-    const { delivered } = await sendVerificationCode(email, config);
+    // Token issuance is fast (DB only) and awaited; delivery is fired without
+    // awaiting — see deliverVerificationEmail for why the response must not
+    // block on it.
+    const otp = await issueVerificationToken(email, config);
+    deliverVerificationEmail(email, otp).catch((err) =>
+      console.error('Background verification email dispatch failed unexpectedly:', err),
+    );
     return {
-      status: delivered ? 'VERIFICATION_SENT' : 'VERIFICATION_PENDING',
-      message: delivered
-        ? 'Account updated. A 6-digit verification code has been sent to your email.'
-        : 'Account updated, but the verification code could not be sent. Please use "resend code".',
+      status: 'VERIFICATION_SENT',
+      message: 'Account updated. A 6-digit verification code is on its way to your email. Use "resend code" if it does not arrive.',
       user: { id: existing.id, email },
     };
   }
@@ -306,14 +351,19 @@ export async function signupWithPassword(
 
   // The account row is already committed, so a delivery failure must never fail
   // the request — that returned a 500 while leaving a real account behind, and
-  // the retry then hit EMAIL_TAKEN. Report the outcome honestly instead; the
-  // re-signup branch above and POST /auth/resend-verification are both exits.
-  const { delivered } = await sendVerificationCode(email, config);
+  // the retry then hit EMAIL_TAKEN. The re-signup branch above and
+  // POST /auth/resend-verification are both exits if delivery fails.
+  //
+  // Token issuance is fast (DB only) and awaited; delivery is fired without
+  // awaiting — see deliverVerificationEmail for why the response must not
+  // block on it.
+  const otp = await issueVerificationToken(email, config);
+  deliverVerificationEmail(email, otp).catch((err) =>
+    console.error('Background verification email dispatch failed unexpectedly:', err),
+  );
   return {
-    status: delivered ? 'VERIFICATION_SENT' : 'VERIFICATION_PENDING',
-    message: delivered
-      ? 'Account created. A 6-digit verification code has been sent to your email.'
-      : 'Account created, but the verification code could not be sent. Please use "resend code".',
+    status: 'VERIFICATION_SENT',
+    message: 'Account created. A 6-digit verification code is on its way to your email. Use "resend code" if it does not arrive.',
     user: { id: userId, email },
   };
 }
@@ -330,7 +380,12 @@ export async function resendVerificationCode(
   const email = emailInput.toLowerCase().trim();
   const user = await findUserByEmail(getAppDb(), email);
   if (user) {
-    await sendVerificationCode(email, config);
+    // Same split as signupWithPassword: issue (fast, awaited) then deliver
+    // (slow, backgrounded) — the response must not block on mail delivery.
+    const otp = await issueVerificationToken(email, config);
+    deliverVerificationEmail(email, otp).catch((err) =>
+      console.error('Background verification email dispatch failed unexpectedly:', err),
+    );
   }
 
   return {
