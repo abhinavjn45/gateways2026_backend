@@ -6,9 +6,8 @@ dist/
 
 # Environment variables & secrets
 .env*
-!.env.example
-!.env.*.example
-
+.env.example
+.env.*.example
 # Logs
 npm-debug.log*
 yarn-debug.log*
@@ -34,11 +33,14 @@ coverage/
 # Project-specific ignored files
 docs/
 *.pdf
-HANDOVER.md
-MEMORY.md
+*.md
+ARCHITECTURE_AND_PLAN.md
+
 
 # Subagent-driven-development scratch workspace
 .superpowers/
+HANDOVER.md
+MEMORY.md
 
 #debugging
 dbg.tmp.ts
